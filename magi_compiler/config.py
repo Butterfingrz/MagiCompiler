@@ -384,12 +384,37 @@ class CompileConfig(BaseSettings):
         return self.__str__(indent=indent)
 
 
+def _get_parallel_topology() -> str:
+    """Return a compact topology string for compile-cache keying.
+
+    Different parallel topologies produce different tensor strides in custom-op
+    meta functions and must not share cached artifacts.
+
+    Resolution order:
+    1. ``MAGI_COMPILE_TOPOLOGY_KEY`` env var (set by the host framework, e.g. athena)
+    2. ``ws{world_size}`` when torch.distributed is initialized
+    3. ``ws1`` (single-process default)
+    """
+    topo = os.environ.get("MAGI_COMPILE_TOPOLOGY_KEY")
+    if topo:
+        return topo
+    if not torch.distributed.is_initialized():
+        return "ws1"
+    return f"ws{torch.distributed.get_world_size()}"
+
+
 def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
-    """Directory name for a model instance: ``model_{idx}[_{tag}]_rank_{rank}``."""
+    """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``.
+
+    Topology encodes all parallel dimension sizes via PSM.topology_key().
+    Different topologies produce different tensor strides in custom-op meta
+    functions; without isolation, stale artifacts trigger stride-mismatch assertions.
+    """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    topo = _get_parallel_topology()
     if model_tag:
-        return f"model_{model_idx}_{model_tag}_rank_{rank}"
-    return f"model_{model_idx}_rank_{rank}"
+        return f"model_{model_idx}_{model_tag}_rank_{rank}_{topo}"
+    return f"model_{model_idx}_rank_{rank}_{topo}"
 
 
 def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None = None) -> Path:
