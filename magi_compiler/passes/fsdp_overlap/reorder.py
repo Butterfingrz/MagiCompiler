@@ -80,13 +80,46 @@ def _is_multi_output(snode: BaseSchedulerNode) -> bool:
     return type(node) is MultiOutput
 
 
+def _size_hint_of(sym) -> int:
+    """Rank-identical size hint for a sympy symbol (0 if unavailable, e.g. in
+    unit tests without a live Inductor graph)."""
+    try:
+        from torch._inductor.virtualized import V
+
+        return int(V.graph.sizevars.size_hint(sym, fallback=0))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
     """Rank-comparable digest of the snode sequence: type + op identity + output
     sizes + sorted origin fx TARGETS.  Origins are required -- a fused pointwise
     kernel is one ComputedBuffer whose class/size hide its contents (relu vs
     relu+sin look identical without them).  Targets only, not node names: names
-    carry per-rank numbering noise."""
+    carry per-rank numbering noise.
+
+    """
+    import sympy
+
     h = hashlib.sha256()
+    sym_canon: dict = {}  # sympy.Symbol -> canonical sympy.Symbol
+
+    def _canon_size(size) -> str:
+        dims = []
+        for d in size:
+            free = getattr(d, "free_symbols", None)
+            if not free:
+                dims.append(repr(d))
+                continue
+            fresh = [sym for sym in free if sym not in sym_canon]
+            # Name-free assignment order; symbol name only as the last-resort
+            # tie-break (see docstring: that case fails safe).
+            fresh.sort(key=lambda sym: (_size_hint_of(sym), d.count(sym), sym.name))
+            for sym in fresh:
+                sym_canon[sym] = sympy.Symbol(f"c{len(sym_canon):04d}")
+            dims.append(repr(d.xreplace(sym_canon)))
+        return "[" + ", ".join(dims) + "]"
+
     for s in order:
         h.update(type(s).__name__.encode())
         for sub in getattr(s, "snodes", None) or (s,):
@@ -96,7 +129,7 @@ def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
             op = getattr(n, "op_overload", None) or getattr(n, "python_kernel_name", None) or type(n).__name__
             h.update(str(op).encode())
             try:
-                h.update(repr(n.get_size()).encode())
+                h.update(_canon_size(n.get_size()).encode())
             except Exception:  # noqa: BLE001
                 pass
             origins = getattr(n, "origins", None)
