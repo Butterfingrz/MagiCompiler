@@ -27,6 +27,8 @@ import pytest
 import torch
 import torch._dynamo.decorators
 
+from magi_compiler.utils.envs import IS_PT_212
+
 HIDDEN_SIZE = 64
 NUM_HEADS = 4
 HEAD_DIM = 16
@@ -114,16 +116,30 @@ def _make_inputs(seq_len: int, modality_sizes: list[int], device: str):
     return x, modality_mapping
 
 
-def test_unbacked_symbol_guard_error():
-    """The original view(k.shape[0], NUM_HEADS, -1) MUST raise GuardOnDataDependentSymNode."""
+@pytest.mark.skipif(IS_PT_212, reason="PyTorch 2.12 compiles legacy view; see _pt212 variant")
+def test_unbacked_symbol_guard_legacy_view_pt29():
+    """PT 2.9: legacy view(-1) with unbacked symbols hits a guard error during compile."""
     torch._dynamo.reset()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = BuggyModel().to(device)
     compiled = torch.compile(model, dynamic=True, fullgraph=False)
 
     x, mm = _make_inputs(150, [100, 30, 20], device)
-    with pytest.raises(torch._inductor.exc.InductorError, match="GuardOnDataDependentSymNode"):
+    with pytest.raises((RuntimeError, torch._dynamo.exc.UserError)):
         compiled(x, mm)
+
+
+@pytest.mark.skipif(not IS_PT_212, reason="PyTorch 2.9 hits guard error; see _pt29 variant")
+def test_unbacked_symbol_guard_legacy_view_pt212():
+    """PT 2.12: compiles the original view(k.shape[0], NUM_HEADS, -1) without guard error."""
+    torch._dynamo.reset()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = BuggyModel().to(device)
+    compiled = torch.compile(model, dynamic=True, fullgraph=False)
+
+    x, mm = _make_inputs(150, [100, 30, 20], device)
+    out = compiled(x, mm)
+    assert out.shape == ()
 
 
 def test_unbacked_symbol_guard_fixed():

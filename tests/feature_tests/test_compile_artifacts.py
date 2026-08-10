@@ -16,6 +16,29 @@
 
 Each test class reproduces the **real failure scenario** that the corresponding
 class in ``compile_artifacts.py`` was written to fix, then verifies the fix.
+
+PT 2.9 → 2.12 behavioral differences
+--------------------------------------
+Three scenarios behave differently across PyTorch versions.  Tests are split
+into ``_pt29`` / ``_pt212`` variants with ``skipif`` guards:
+
+1. **View tensor bad reducer** (Patch A — ``TestGraphPicklerPatchUtils``):
+   A "bad" reducer that replaces ``FakeTensorMode`` with ``None`` during
+   serialization causes ``AssertionError`` on PT 2.9 because
+   ``base.fake_mode=None`` breaks the deserialization fast-path.
+   PT 2.12 added auto-repair logic that restores view tensors into the
+   session ``FakeTensorMode``, so the same bad reducer no longer crashes.
+
+2. **Third-party op serialization** (Patch B+C — ``TestGraphNodePicklePatchUtils``):
+   ``_OpPickleData.pickle(einops.rearrange)`` raises ``NotImplementedError``
+   on PT 2.9 (unknown op type), requiring Patch C to fall back to
+   ``_OpImportablePickleData`` (stores module_name + qualname, re-imports
+   on deserialize).  PT 2.12 natively handles third-party callables in
+   ``_OpPickleData.pickle``, so Patch C is not triggered.
+
+3. **Unknown op handling** (Patch C — ``TestGraphNodeOpPatchUtils``):
+   Same root cause as (2), tested from the ``_OpPickleData.pickle`` entry
+   point directly.  PT 2.9 raises; PT 2.12 returns a valid ``_OpPickleData``.
 """
 
 import math
@@ -35,6 +58,7 @@ from magi_compiler.magi_backend.compile_artifacts import (
     _import_by_qualname,
     _OpImportablePickleData,
 )
+from magi_compiler.utils.envs import IS_PT_212
 
 
 def _make_graph_with_nodes(*names):
@@ -297,9 +321,14 @@ class TestGraphPicklerPatchUtils:
         assert desc_cleared.base is not None
         assert desc_cleared.base.fake_mode is fake_mode  # still the live object!
 
-    def test_view_tensor_old_reducer_fails(self):
-        """Reproduce: serializing view tensor with FakeTensorMode→None
-        breaks deserialization with AssertionError."""
+    # -- Version-split: view tensor bad reducer (see docstring item 1) --
+    @pytest.mark.skipif(IS_PT_212, reason="PyTorch 2.12 handles view tensors natively; see _pt212 variant")
+    def test_view_tensor_bad_reducer_pt29(self):
+        """PT 2.9: bad reducer (FakeTensorMode→None) breaks view tensor deserialization.
+
+        base.fake_mode=None causes the deserialization fast-path to hit
+        AssertionError because it cannot reconstruct the view relationship.
+        """
         from unittest.mock import patch
 
         from torch._subclasses import FakeTensorMode
@@ -313,17 +342,49 @@ class TestGraphPicklerPatchUtils:
 
         def bad_reducer(self, obj):
             if isinstance(obj, FakeTensorMode):
-                return type(None), ()  # → None (the old, broken approach)
+                return type(None), ()
             return orig_reducer(self, obj)
 
         with patch.object(GraphPickler, "reducer_override", bad_reducer):
             data = GraphPickler.dumps(ft_view, Options(ops_filter=None))
 
-        # Deserialization fails because base.fake_mode=None → fast path fails
         env2 = ShapeEnv()
         fm2 = FakeTensorMode(shape_env=env2)
         with pytest.raises(AssertionError):
             GraphPickler.loads(data, fm2)
+
+    @pytest.mark.skipif(not IS_PT_212, reason="PyTorch 2.9 fails on bad reducer; see _pt29 variant")
+    def test_view_tensor_bad_reducer_pt212(self):
+        """PT 2.12: view tensors are restored into session FakeTensorMode even with a bad reducer.
+
+        PT 2.12's GraphPickler.loads auto-repairs base.fake_mode during
+        deserialization, so the same bad reducer that crashes 2.9 works here.
+        """
+        from unittest.mock import patch
+
+        from torch._subclasses import FakeTensorMode
+        from torch.fx._graph_pickler import GraphPickler, Options
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        ft, fake_mode, env = self._make_dynamic_fake_tensor()
+        ft_view = ft.transpose(1, 2)
+
+        orig_reducer = GraphPickler.reducer_override
+
+        def bad_reducer(self, obj):
+            if isinstance(obj, FakeTensorMode):
+                return type(None), ()
+            return orig_reducer(self, obj)
+
+        with patch.object(GraphPickler, "reducer_override", bad_reducer):
+            data = GraphPickler.dumps(ft_view, Options(ops_filter=None))
+
+        env2 = ShapeEnv()
+        fm2 = FakeTensorMode(shape_env=env2)
+        ft_loaded = GraphPickler.loads(data, fm2)
+
+        assert ft_loaded.fake_mode is fm2
+        assert ft_loaded.shape == ft_view.shape
 
     def test_view_tensor_fixed_reducer_succeeds(self):
         """The fix: FakeTensorMode → _restore_fake_mode(unpickle_state)
@@ -491,8 +552,14 @@ class TestGraphNodePicklePatchUtils:
         assert isinstance(data.target, _OpPickleData)
         assert hasattr(data.target, "unpickle")
 
-    def test_patched_init_with_einops_needs_patch_c(self):
-        """Third-party functions like einops.rearrange need Patch C on _OpPickleData.pickle."""
+    # -- Version-split: third-party op serialization (see docstring item 2) --
+    @pytest.mark.skipif(IS_PT_212, reason="PyTorch 2.12 handles unknown ops natively; see _pt212 variant")
+    def test_patched_init_with_einops_needs_patch_c_pt29(self):
+        """PT 2.9: third-party functions like einops.rearrange need Patch C fallback.
+
+        _OpPickleData.pickle raises NotImplementedError for non-torch ops,
+        so Patch C catches the error and falls back to _OpImportablePickleData.
+        """
         from unittest.mock import patch
 
         einops = pytest.importorskip("einops")
@@ -509,12 +576,35 @@ class TestGraphNodePicklePatchUtils:
             pass
 
         data = FakeNPD()
-        # Both Patch B and Patch C must be applied for einops
         with patch.object(_OpPickleData, "pickle", patched_op_pickle):
             patched_init(data, r, {x: "PD_x"}, Options(ops_filter=None))
 
         assert isinstance(data.target, _OpImportablePickleData)
         assert data.target.module_name == "einops.einops"
+
+    @pytest.mark.skipif(not IS_PT_212, reason="PyTorch 2.9 needs Patch C; see _pt29 variant")
+    def test_patched_init_with_einops_native_pt212(self):
+        """PT 2.12: third-party functions handled natively without Patch C.
+
+        _OpPickleData.pickle now supports non-torch callables, returning a
+        standard _OpPickleData — Patch C is never triggered.
+        """
+        einops = pytest.importorskip("einops")
+        from torch.fx._graph_pickler import Options, _OpPickleData
+
+        g = fx.Graph()
+        x = g.placeholder("x")
+        r = g.call_function(einops.rearrange, (x, "b (h d) -> b h d"), {"h": 2})
+
+        patched_init, _ = GraphNodePicklePatchUtils.make_patch_for_init()
+
+        class FakeNPD:
+            pass
+
+        data = FakeNPD()
+        patched_init(data, r, {x: "PD_x"}, Options(ops_filter=None))
+
+        assert isinstance(data.target, _OpPickleData)
 
     # ── Scenario 4: Triton kernel extraction ──
 
@@ -589,8 +679,10 @@ class TestGraphNodeOpPatchUtils:
     and falls back to ``_OpImportablePickleData``.
     """
 
-    def test_original_pickle_raises_for_unknown_op(self):
-        """Reproduce: _OpPickleData.pickle raises for unknown third-party ops."""
+    # -- Version-split: unknown op handling (see docstring item 3) --
+    @pytest.mark.skipif(IS_PT_212, reason="PyTorch 2.12 handles unknown ops natively; see _pt212 variant")
+    def test_original_pickle_unknown_op_pt29(self):
+        """PT 2.9: _OpPickleData.pickle raises NotImplementedError for unknown third-party ops."""
         from torch.fx._graph_pickler import Options, _OpPickleData
 
         einops = pytest.importorskip("einops")
@@ -598,8 +690,19 @@ class TestGraphNodeOpPatchUtils:
         with pytest.raises(NotImplementedError):
             _OpPickleData.pickle(einops.rearrange, Options(ops_filter=None))
 
-    def test_patched_pickle_catches_error(self):
-        """The fix: patched pickle falls back to _OpImportablePickleData."""
+    @pytest.mark.skipif(not IS_PT_212, reason="PyTorch 2.9 raises for unknown ops; see _pt29 variant")
+    def test_original_pickle_unknown_op_pt212(self):
+        """PT 2.12: _OpPickleData.pickle handles unknown third-party ops natively."""
+        from torch.fx._graph_pickler import Options, _OpPickleData
+
+        einops = pytest.importorskip("einops")
+
+        result = _OpPickleData.pickle(einops.rearrange, Options(ops_filter=None))
+        assert isinstance(result, _OpPickleData)
+
+    @pytest.mark.skipif(IS_PT_212, reason="PyTorch 2.12 handles unknown ops natively; see _pt212 variant")
+    def test_patched_pickle_catches_error_pt29(self):
+        """PT 2.9: patched pickle falls back to _OpImportablePickleData for unknown ops."""
         from unittest.mock import patch
 
         from torch.fx._graph_pickler import Options, _OpPickleData
@@ -615,9 +718,25 @@ class TestGraphNodeOpPatchUtils:
         assert result.module_name == "einops.einops"
         assert result.qualname == "rearrange"
 
-        # unpickle should import back the function
         restored = result.unpickle(None)
         assert restored is einops.rearrange
+
+    @pytest.mark.skipif(not IS_PT_212, reason="PyTorch 2.9 uses fallback; see _pt29 variant")
+    def test_patched_pickle_passthrough_pt212(self):
+        """PT 2.12: patched pickle passes through to native handling (no fallback needed)."""
+        from unittest.mock import patch
+
+        from torch.fx._graph_pickler import Options, _OpPickleData
+
+        einops = pytest.importorskip("einops")
+
+        patched = GraphNodeOpPatchUtils.make_patch_for_pickle()
+
+        with patch.object(_OpPickleData, "pickle", patched):
+            result = _OpPickleData.pickle(einops.rearrange, Options(ops_filter=None))
+
+        assert isinstance(result, _OpPickleData)
+        assert not isinstance(result, _OpImportablePickleData)
 
     def test_known_ops_pass_through(self):
         """torch ops should pass through the original path, not the fallback."""

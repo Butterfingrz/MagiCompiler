@@ -18,6 +18,7 @@
 import torch
 
 from ...magi_depyf.timeline import emit_pass_lifecycle
+from ...utils.envs import IS_PT_212
 from ..pass_base import MagiInductorPass
 
 
@@ -37,5 +38,9 @@ class ND_TilingWorkaroundPass(MagiInductorPass):
         # dynamic-shape transpose/permute/channels-last kernels degrade to untiled Grid1D.
         # Forcing prefer_nd_tiling restores ND tiling.
         torch._inductor.config.triton.prefer_nd_tiling = True
-        torch._inductor.config.triton.max_tiles = 3
         torch._inductor.config.triton.tile_reductions = True
+
+        # PT 2.12 Inductor generates invalid 3D-grid reduction kernels with
+        # max_tiles=3 (program_id(2) mapped to a non-existent grid dim).
+        # Cap at 2 on PT >= 2.12 until the upstream fix lands.
+        torch._inductor.config.triton.max_tiles = 2 if IS_PT_212 else 3

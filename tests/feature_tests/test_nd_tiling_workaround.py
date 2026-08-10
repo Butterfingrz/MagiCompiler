@@ -48,14 +48,18 @@ def _restore_inductor_config():
     try:
         yield
     finally:
-        cfg.triton.prefer_nd_tiling, cfg.triton.max_tiles, cfg.triton.tile_reductions = saved
+        (cfg.triton.prefer_nd_tiling, cfg.triton.max_tiles, cfg.triton.tile_reductions) = saved
+
+
+from magi_compiler.utils.envs import IS_PT_212
 
 
 def _assert_injected(injected):
     cfg = torch._inductor.config
     if injected:
         assert cfg.triton.prefer_nd_tiling is True
-        assert cfg.triton.max_tiles == 3
+        expected_max_tiles = 2 if IS_PT_212 else 3
+        assert cfg.triton.max_tiles == expected_max_tiles
         assert cfg.triton.tile_reductions is True
     else:
         assert cfg.triton.prefer_nd_tiling is False
@@ -94,3 +98,80 @@ def test_auto_skips_when_graph_not_conv_heavy(fake_mode):
     gm = build_graph_module(fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=320)
     pass_(gm.graph)
     _assert_injected(False)
+
+
+# ---------------------------------------------------------------------------
+# GPU integration tests: reproduce the max_tiles=3 Inductor codegen bug and
+# verify the max_tiles=2 fix.
+#
+# PT 2.12 Inductor generates a 3D-grid reduction kernel (program_id(2)) when
+# max_tiles=3 + tile_reductions=True, but launches with a 2D grid, causing
+# Triton to crash with AttributeError("'NoneType' ... 'type'").
+# Triton itself supports program_id(2) fine; the bug is in Inductor codegen.
+# ---------------------------------------------------------------------------
+
+
+class _ConvGroupNorm(torch.nn.Module):
+    """Minimal model that triggers a fused convolution + group_norm reduction kernel.
+
+    48 channels + GroupNorm(8) produces a ``triton_red_fused_convolution_native_group_norm``
+    kernel whose pointwise + reduction split, combined with max_tiles=3, makes Inductor
+    generate ``tl.program_id(2)`` for a grid dim that doesn't exist.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv3d(48, 48, 3, padding=1)
+        self.gn = torch.nn.GroupNorm(8, 48)
+
+    def forward(self, x):
+        return self.gn(self.conv(x))
+
+
+_BUG_INPUT_SHAPE = (1, 48, 7, 34, 60)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not IS_PT_212, reason="bug only manifests on PT >= 2.12")
+def test_max_tiles_3_crashes_on_pt212():
+    """Reproduce: max_tiles=3 + tile_reductions generates invalid 3D-grid kernel on PT 2.12."""
+    torch._inductor.config.triton.prefer_nd_tiling = True
+    torch._inductor.config.triton.max_tiles = 3
+    torch._inductor.config.triton.tile_reductions = True
+
+    model = _ConvGroupNorm().cuda().bfloat16().eval()
+    x = torch.randn(*_BUG_INPUT_SHAPE, device="cuda", dtype=torch.bfloat16)
+
+    compiled = torch.compile(model, backend="inductor")
+    with pytest.raises(Exception, match="NoneType|program_id|InductorError"):
+        with torch.no_grad():
+            compiled(x)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_max_tiles_2_compiles_successfully():
+    """Verify: max_tiles=2 avoids the 3D-grid bug on all PT versions."""
+    torch._inductor.config.triton.prefer_nd_tiling = True
+    torch._inductor.config.triton.max_tiles = 2
+    torch._inductor.config.triton.tile_reductions = True
+
+    model = _ConvGroupNorm().cuda().bfloat16().eval()
+    x = torch.randn(*_BUG_INPUT_SHAPE, device="cuda", dtype=torch.bfloat16)
+
+    compiled = torch.compile(model, backend="inductor")
+    with torch.no_grad():
+        out = compiled(x)
+    assert out.shape == _BUG_INPUT_SHAPE
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not IS_PT_212, reason="version-aware logic only differs on PT >= 2.12")
+def test_nd_tiling_pass_uses_safe_max_tiles_on_pt212(fake_mode):
+    """End-to-end: the pass itself picks max_tiles=2 on PT 2.12."""
+    pass_ = ND_TilingWorkaroundPass()
+    gm = _auto_eligible_graph(fake_mode)
+    pass_(gm.graph)
+
+    assert torch._inductor.config.triton.prefer_nd_tiling is True
+    assert torch._inductor.config.triton.max_tiles == 2
+    assert torch._inductor.config.triton.tile_reductions is True

@@ -27,6 +27,7 @@ from typing import Callable, Literal
 import torch
 
 from magi_compiler.config import CompileConfig, model_rank_dir_name
+from magi_compiler.magi_backend._aot_compat import extract_aot_artifacts_from_fn, load_aot_artifacts, save_aot_artifacts
 from magi_compiler.magi_backend.magi_backend import init_backend
 from magi_compiler.magi_depyf.timeline import emit_after_dynamo_bytecode_transform, observe_lifecycle
 from magi_compiler.utils import OrderedSet, compute_code_hash, compute_hash, magi_logger
@@ -113,7 +114,6 @@ class MagiCompileState:
         self.compiled_entry: Callable | None = None
         self.jit_compiled_code: CodeType | None = None
         self.aot_compiled_fn: Callable | None = None
-        self.aot_compile_artifacts: object | None = None
 
     def _ensure_compiled(self):
         """Lazy initialization of the ``torch.compile`` wrapper.
@@ -185,25 +185,23 @@ class MagiCompileState:
 
         magi_logger.info("AOT cache hit: loading compiled artifacts from %s", aot_path)
 
-        from torch._dynamo.aot_compile import CompileArtifacts
-
-        with open(aot_path, "rb") as f:
-            self.aot_compile_artifacts = CompileArtifacts.deserialize(f.read())
-        self.aot_compiled_fn = self.aot_compile_artifacts.compiled_function()
+        self.aot_compiled_fn = load_aot_artifacts(aot_path, f_globals=self._aot_f_globals())
         magi_logger.info("AOT cache loaded successfully from %s", aot_path)
         return True
 
     @observe_lifecycle("aot_artifact_save")
     def save_aot_compile_artifacts(self) -> None:
         """Save the AOT-compiled function and source checksum to disk."""
-        from torch._dynamo.aot_compile import CompileArtifacts
-
         aot_path = self.aot_compilation_path
 
-        with open(aot_path, "wb") as f:
-            f.write(CompileArtifacts.serialize(self.aot_compile_artifacts))
+        assert self.aot_compiled_fn is not None
+        save_aot_artifacts(self.aot_compiled_fn, aot_path, aot_compile_artifacts=getattr(self, "aot_compile_artifacts", None))
         _save_source_checksum(self.aot_compilation_path, self.traced_files)
         magi_logger.info("AOT path: artifacts saved to %s", aot_path)
+
+    def _aot_f_globals(self) -> dict[str, object] | None:
+        entry = getattr(self.original_entry, "__func__", self.original_entry)
+        return getattr(entry, "__globals__", None)
 
     _AOT_MAX_RETRIES = 3
 
@@ -233,9 +231,9 @@ class MagiCompileState:
         for attempt in range(self._AOT_MAX_RETRIES):
             try:
                 self.aot_compiled_fn = self.compiled_entry.aot_compile((args, kwargs))
-                save_fn = self.aot_compiled_fn.save_compiled_function
-                idx = save_fn.__code__.co_freevars.index("self")
-                self.aot_compile_artifacts = save_fn.__closure__[idx].cell_contents
+                artifacts = extract_aot_artifacts_from_fn(self.aot_compiled_fn)
+                if artifacts is not None:
+                    self.aot_compile_artifacts = artifacts
                 return
             except TensorifyScalarRestartAnalysis:
                 if attempt >= self._AOT_MAX_RETRIES - 1:
