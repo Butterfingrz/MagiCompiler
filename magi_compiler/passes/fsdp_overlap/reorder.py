@@ -36,10 +36,12 @@ Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 (1 packed launch + N MultiOutput members moved together as one block + N waits).
 """
 
+import bisect
 import hashlib
 from collections import defaultdict
 
 import torch
+import torch.distributed as dist
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.ir import MultiOutput
 from torch._inductor.scheduler import BaseSchedulerNode
@@ -89,6 +91,29 @@ def _size_hint_of(sym) -> int:
         return int(V.graph.sizevars.size_hint(sym, fallback=0))
     except Exception:  # noqa: BLE001
         return 0
+
+
+def _collective_kind_key(snode: BaseSchedulerNode) -> tuple:
+    """Coarse, rank-comparable identity of one NCCL-issuing snode."""
+    node = _leaf_collective_node(snode) or getattr(snode, "node", None)
+    op = getattr(node, "op_overload", None) or getattr(node, "python_kernel_name", None) or type(node).__name__
+    dims: tuple = ()
+    try:
+        dims = tuple("?" if getattr(d, "free_symbols", None) else int(d) for d in node.get_size())
+    except Exception:  # noqa: BLE001
+        pass
+    return (_is_weight_gather(snode), str(op), dims)
+
+
+def _collective_skeleton(order: list[BaseSchedulerNode]) -> tuple[list[int], list[tuple]]:
+    """The graph's collective skeleton: indices (ascending) and rank-comparable
+    kinds of every snode that ISSUES NCCL -- functional collectives plus custom ops
+    with an internal collective . This sequence is what must stay rank-identical;
+    the compute between two consecutive entries is rank-private."""
+    from magi_compiler.profiling.runtime_estimator import snode_issues_collective
+
+    idx = [i for i, s in enumerate(order) if snode_issues_collective(s)]
+    return idx, [_collective_kind_key(order[i]) for i in idx]
 
 
 def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
@@ -211,34 +236,14 @@ class FsdpOverlapReorder:
 
         index_of = {s: i for i, s in enumerate(order)}
 
-        # Fail-fast: the index-based sweep (and the lockstep profiling below) both
-        # require structurally IDENTICAL per-rank graphs, else the weight gathers
-        # interleave with other collectives in rank-divergent order -> NCCL
-        # deadlock.  Verify with one symmetric all_gather of a graph digest; every
-        # rank sees the same result, so all ranks take the same branch.
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
-
-            fp = (_graph_fingerprint(order), len(order), len(launches))
-            world = dist.get_world_size()
-            all_fp: list = [None] * world
-            dist.all_gather_object(all_fp, fp, group=_get_cost_sync_group())
-            if any(f != all_fp[0] for f in all_fp[1:]):
-                magi_logger.warning(
-                    "FSDP overlap reorder: per-rank graphs are NOT structurally identical "
-                    "((digest, n_snodes, n_weight_gathers) per rank: %s). Reordering would "
-                    "produce rank-divergent collective order -> NCCL deadlock; leaving the "
-                    "graph unchanged (overlap OFF for this graph). Likely cause: uneven "
-                    "Shard(0) params -- replicate them or use chunk-padded uniform shards.",
-                    [(f[0][:12], f[1], f[2]) if f else None for f in all_fp],
-                )
-                return order
+        skel_idx, skel_kinds = _collective_skeleton(order)
+        mode, sync_group, world = self._negotiate_mode(order, launches, skel_kinds)
+        if mode == "abort":
+            return order
 
         # profile_sync: warm the estimator table on every node, then re-measure in
-        # rank-lockstep (warm_and_sync) so costs are rank-identical.  On failure,
-        # leave the graph unchanged (overlap off, no hang).
+        # rank-lockstep (warm_and_sync) so shared keys get real, max-reduced costs.
+        # On failure, leave the graph unchanged (overlap off, no hang).
         if hasattr(self._cost_fn, "warm_and_sync") and getattr(self._cost_fn, "_sync_across_ranks", False):
             try:
                 for s in order:
@@ -257,6 +262,7 @@ class FsdpOverlapReorder:
         launches_in_order = sorted(launches, key=lambda s: index_of[s])  # original program order
 
         plans = []  # (launch, group, fc_idx, comm_runtime, lower)
+        lowers: dict = {}  # launch -> earliest legal index (real-dep floor)
         for launch in launches_in_order:
             group = self._launch_group(launch, order, buf_to_snode, users)
             fc_idx = self._first_consumer_index(launch, group, order, users)
@@ -264,6 +270,11 @@ class FsdpOverlapReorder:
                 continue
             comm_runtime = self._cost(launch)
             lower = self._earliest_legal_index(group, order, index_of, buf_to_snode, op_to_snode)
+            if mode == "pinned":
+                # No skeleton to negotiate against: keep the AG between the same two
+                # NCCL-issuing snodes it already sat between.
+                lower = self._raise_lower_for_nccl_barriers(lower, index_of[launch], order)
+            lowers[launch] = lower
             plans.append((launch, group, fc_idx, comm_runtime, lower))
 
         targets: dict = {}  # launch -> target index (in original order space)
@@ -312,12 +323,11 @@ class FsdpOverlapReorder:
                 "hidden" if acc >= need else "COMPUTE-LIMITED",
             )
 
-        # Clamp targets NON-DECREASING in original program order.  NCCL matches the
-        # Nth call on a PG positionally across ranks, so the gathers' relative order
-        # must be rank-identical; `max(lower, t)` can invert two gathers and whether
-        # the inversion happens depends on per-rank cost jitter -> deadlock.  The
-        # clamp pins the original subsequence at the cost of occasionally placing a
-        # launch later than its compute window would allow.
+        if world > 1 and mode != "pinned":
+            self._consensus_slot_targets(targets, lowers, launches_in_order, skel_idx, index_of, sync_group, world)
+
+        # Keep gather order: clamp targets non-decreasing so cost jitter or
+        # same-slot per-rank indices cannot swap two launches.
         running = -1
         for launch in launches_in_order:
             if launch not in targets:
@@ -345,10 +355,19 @@ class FsdpOverlapReorder:
 
         new_order = sorted(order, key=_key)
         # Validate the rebuilt order is a valid topological order; only commit if so.
-        if self._validate_full(new_order, op_to_snode, buf_to_snode, users):
+        # The verdict is reduced across ranks: committing on some ranks and not on
+        # others is itself a divergent NCCL sequence.
+        ok = self._validate_full(new_order, op_to_snode, buf_to_snode, users)
+        if not ok:
+            magi_logger.warning("FSDP overlap reorder: rebuilt order failed validation; leaving graph unchanged")
+        if self._agree(ok, sync_group, world):
             order[:] = new_order
         else:
-            magi_logger.warning("FSDP overlap reorder: rebuilt order failed validation; leaving graph unchanged")
+            if ok:
+                magi_logger.warning(
+                    "FSDP overlap reorder: another rank did not commit its rebuilt order; "
+                    "leaving this rank's graph unchanged too"
+                )
             moved = 0
 
         measured = getattr(self._cost_fn, "n_measured", None)
@@ -368,6 +387,108 @@ class FsdpOverlapReorder:
         if hasattr(self._cost_fn, "summary"):
             magi_logger.debug("FSDP overlap %s", self._cost_fn.summary())
         return order
+
+    # -- multi-rank agreement ---------------------------------------------
+    @staticmethod
+    def _negotiate_mode(order, launches, skel_kinds) -> tuple[str, object, int]:
+        """Rank-identical placement mode: (mode, group, world).
+
+        ``identical`` / ``slot``: skeletons match → consensus slots (in-slot index is per-rank).
+        ``pinned``: skeletons differ → keep each AG between its neighboring NCCL snodes.
+        ``abort``: weight-AG counts differ → leave the graph unchanged.
+        """
+        from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
+
+        group = _get_cost_sync_group()
+        world = dist.get_world_size()
+        mine = ((_graph_fingerprint(order), len(order), len(launches)), tuple(skel_kinds))
+        peers: list = [None] * world
+        dist.all_gather_object(peers, mine, group=group)
+        if all(p == peers[0] for p in peers[1:]):
+            return "identical", group, world
+
+        desc = [(p[0][0][:12], p[0][1], p[0][2], len(p[1])) for p in peers]
+        n_ag = [p[0][2] for p in peers]
+        if any(g != n_ag[0] for g in n_ag[1:]):
+            magi_logger.warning(
+                "FSDP overlap reorder: per-rank graphs differ AND weight-AG counts diverge "
+                "((digest, n_snodes, n_weight_gathers, n_collectives) per rank: %s). No rank "
+                "correspondence to reconcile; leaving the graph unchanged (overlap OFF).",
+                desc,
+            )
+            return "abort", group, world
+        if all(p[1] == peers[0][1] for p in peers[1:]):
+            magi_logger.warning(
+                "FSDP overlap reorder: per-rank graphs are NOT structurally identical "
+                "((digest, n_snodes, n_weight_gathers, n_collectives) per rank: %s), but the "
+                "collective skeleton matches. Continuing in SLOT-consensus mode: gathers are "
+                "placed in a rank-negotiated skeleton slot (they MAY hop CP / EP kernels, as "
+                "long as every rank hops the same one).",
+                desc,
+            )
+            return "slot", group, world
+        magi_logger.warning(
+            "FSDP overlap reorder: per-rank graphs are NOT structurally identical AND their "
+            "collective skeletons differ ((digest, n_snodes, n_weight_gathers, n_collectives) "
+            "per rank: %s). Continuing in PINNED mode: gathers keep their position relative to "
+            "every NCCL-issuing snode (no hop over CP / EP kernels).",
+            desc,
+        )
+        return "pinned", group, world
+
+    @staticmethod
+    def _agree(ok: bool, sync_group, world: int) -> bool:
+        """Reduce a local yes/no into a rank-identical one (AND over ranks)."""
+        if world <= 1:
+            return ok
+
+        try:
+            t = torch.tensor([1 if ok else 0], dtype=torch.int32)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN, group=sync_group)
+            return bool(t.item())
+        except Exception as exc:  # noqa: BLE001
+            magi_logger.warning("FSDP overlap reorder: cross-rank agreement failed (%s); leaving graph unchanged", exc)
+            return False
+
+    @staticmethod
+    def _consensus_slot_targets(targets, lowers, launches_in_order, skel_idx, index_of, sync_group, world) -> None:
+        """Put each gather in the same skeleton slot on every rank (max of desired
+        slot and dep floor, then non-decreasing).  Index inside the slot stays local.
+        """
+
+        def slot_of(idx: int) -> int:
+            return bisect.bisect_left(skel_idx, idx)
+
+        # One entry per launch in program order so skipped gathers stay aligned.
+        mine = []
+        for launch in launches_in_order:
+            own = slot_of(index_of[launch])
+            mine.append((slot_of(targets[launch][0]), slot_of(lowers[launch])) if launch in targets else (own, own))
+        peers: list = [None] * world
+        dist.all_gather_object(peers, mine, group=sync_group)
+
+        running = 0
+        for j, launch in enumerate(launches_in_order):
+            q = max(max(p[j][0] for p in peers), max(p[j][1] for p in peers))
+            q = running = max(q, running)
+            if launch not in targets:
+                continue
+            target, group = targets[launch]
+            slot_lo = max(lowers[launch], skel_idx[q - 1] + 1 if q > 0 else 0)
+            slot_hi = skel_idx[q] if q < len(skel_idx) else index_of[launch]
+            new_target = min(max(target, slot_lo), slot_hi)
+            targets[launch] = (new_target, group)
+            magi_logger.debug(
+                "FSDP overlap slot consensus: launch cur=%d slot=%d/%d (mine=%s) target %d -> %d [%d, %d]",
+                index_of[launch],
+                q,
+                slot_of(index_of[launch]),
+                mine[j],
+                target,
+                new_target,
+                slot_lo,
+                slot_hi,
+            )
 
     # -- group detection --------------------------------------------------
     def _launch_group(self, launch, order, buf_to_snode, users) -> list[BaseSchedulerNode]:
@@ -444,6 +565,18 @@ class FsdpOverlapReorder:
         return self._cost(snode) <= 1.0
 
     # -- repositioning ----------------------------------------------------
+    @staticmethod
+    def _raise_lower_for_nccl_barriers(lower: int, launch_idx: int, order: list) -> int:
+        """Raise ``lower`` so a weight AG cannot hop any NCCL-issuing snode that
+        originally precedes it."""
+        from magi_compiler.profiling.runtime_estimator import snode_issues_collective
+
+        barrier = lower
+        for i in range(lower, launch_idx):
+            if snode_issues_collective(order[i]):
+                barrier = i + 1
+        return barrier
+
     def _earliest_legal_index(self, group, order, index_of, buf_to_snode, op_to_snode) -> int:
         """1 + max index of any REAL (non-fake buffer) producer the group needs.
 
